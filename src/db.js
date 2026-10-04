@@ -2,6 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
 let db;
@@ -518,6 +519,38 @@ function replaceAllPieces(designId, pieces) {
     for (const pc of rows) addPiece(designId, pc);
   });
   tx(pieces);
+}
+
+// 草稿内容指纹：拼片集合（行 id/编号/颜色/顶点）的 sha256。
+// 草稿任何增、删、改（含改色）都会改变指纹；拼片转置用它判定
+// “预览之后目标草稿是否被编辑”，一致才允许确认写入。
+function draftFingerprint(designId) {
+  const rows = getDb()
+    .prepare('SELECT id, piece_no, color, polygon FROM pieces WHERE design_id = ? ORDER BY id')
+    .all(designId);
+  return crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+}
+
+// 拼片转置整批写入：同一事务内复核草稿指纹（可选）并连续赋号插入全部拼片；
+// 指纹不符或任一步失败整体回滚，绝不留下半批。
+function addPiecesBatch(designId, items, expectedFingerprint) {
+  const d = getDb();
+  const txn = d.transaction(() => {
+    if (expectedFingerprint !== undefined && expectedFingerprint !== draftFingerprint(designId)) {
+      return { code: 'draft_changed' };
+    }
+    const inserted = [];
+    for (const it of items) {
+      const pieceNo = nextPieceNo(designId);
+      const info = d
+        .prepare('INSERT INTO pieces (design_id, piece_no, color, polygon) VALUES (?, ?, ?, ?)')
+        .run(designId, pieceNo, it.color, JSON.stringify(it.polygon));
+      inserted.push(getPiece(designId, info.lastInsertRowid));
+    }
+    touchDesign(designId);
+    return { code: 'ok', pieces: inserted };
+  });
+  return txn.immediate();
 }
 
 function touchDesign(designId) {
@@ -2217,6 +2250,7 @@ module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
   listPieces, getPiece, addPiece, updatePiece, deletePiece, replaceAllPieces,
+  draftFingerprint, addPiecesBatch,
   publishVersion, getPublication, getPublicationByVersion, getPublicationById, listPublications,
   listMaterials, getMaterial, getMaterialRow, getMaterialByName, createMaterial, updateMaterial,
   createPlan, getPlan, getPlanRow, listPlans, updatePlanDraft, confirmPlan, cancelPlan, deletePlan,

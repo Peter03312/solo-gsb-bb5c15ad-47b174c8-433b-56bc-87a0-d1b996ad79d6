@@ -708,6 +708,7 @@ function switchTab(which) {
   document.getElementById('tabDraft').classList.toggle('active', which === 'draft');
   document.getElementById('tabPublished').classList.toggle('active', which === 'published');
   document.getElementById('tabDiff').classList.toggle('active', which === 'diff');
+  document.getElementById('tabTransfer').classList.toggle('active', which === 'transfer');
   document.getElementById('tabPrint').classList.toggle('active', which === 'print');
   document.getElementById('tabProduction').classList.toggle('active', which === 'production');
   document.getElementById('tabCutting').classList.toggle('active', which === 'cutting');
@@ -718,6 +719,7 @@ function switchTab(which) {
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
   document.getElementById('viewDiff').hidden = which !== 'diff';
+  document.getElementById('viewTransfer').hidden = which !== 'transfer';
   document.getElementById('viewPrint').hidden = which !== 'print';
   document.getElementById('viewProduction').hidden = which !== 'production';
   document.getElementById('viewCutting').hidden = which !== 'cutting';
@@ -727,6 +729,7 @@ function switchTab(which) {
   document.getElementById('viewLedger').hidden = which !== 'ledger';
   if (which === 'published') loadPubVersions();
   if (which === 'diff') enterDiff();
+  if (which === 'transfer') enterTransfer();
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
   if (which === 'cutting') enterCutting();
@@ -3096,3 +3099,348 @@ document.getElementById('ledgerType').addEventListener('change', () => {
   ledgerLoadSpecs().catch((e) => ledgerBanner('error', '⛔ ' + (e.data?.error || e.message)));
 });
 document.getElementById('btnLedgerQuery').addEventListener('click', () => { ledgerQuery(); });
+
+// ================= 拼片转置 =================
+
+const tr = {
+  sourcePub: null,      // 来源发布版完整对象（含 snapshot）
+  selected: new Set(),  // 已勾选的来源拼片编号
+  preview: null,        // 最近一次成功预览（含 previewToken）
+};
+
+const trCanvas = document.getElementById('trCanvas');
+const trCtx = trCanvas.getContext('2d');
+
+function trBanner(kind, msg) {
+  const b = document.getElementById('trBanner');
+  if (!kind) { b.hidden = true; b.textContent = ''; return; }
+  b.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  b.hidden = false;
+  b.innerHTML = msg;
+  clearTimeout(trBanner._t);
+  if (kind === 'success') trBanner._t = setTimeout(() => { b.hidden = true; }, 4000);
+}
+
+async function enterTransfer() {
+  trBanner(false);
+  const data = await api('GET', '/api/designs');
+  const srcSel = document.getElementById('trSourceDesign');
+  const tgtSel = document.getElementById('trTargetDesign');
+  const prevSrc = srcSel.value;
+  const prevTgt = tgtSel.value;
+  srcSel.innerHTML = '';
+  tgtSel.innerHTML = '';
+  for (const d of data.designs) {
+    const o1 = document.createElement('option');
+    o1.value = d.id;
+    o1.textContent = d.latest_version
+      ? `${d.name}（最新 v${d.latest_version}）`
+      : `${d.name}（暂无发布版）`;
+    srcSel.appendChild(o1);
+    const o2 = document.createElement('option');
+    o2.value = d.id;
+    o2.textContent = `${d.name}（${d.width}×${d.height}mm · 草稿 ${d.piece_count} 片）`;
+    tgtSel.appendChild(o2);
+  }
+  if ([...srcSel.options].some((o) => o.value === prevSrc)) srcSel.value = prevSrc;
+  if ([...tgtSel.options].some((o) => o.value === prevTgt)) tgtSel.value = prevTgt;
+  await loadTrVersions();
+  renderTrCanvas();
+}
+
+async function loadTrVersions() {
+  const id = Number(document.getElementById('trSourceDesign').value);
+  const sel = document.getElementById('trSourceVersion');
+  sel.innerHTML = '';
+  tr.sourcePub = null;
+  tr.selected.clear();
+  renderTrPieceList();
+  trInvalidate();
+  if (!id) return;
+  const data = await api('GET', `/api/designs/${id}/publications`);
+  if (!data.publications.length) {
+    sel.innerHTML = '<option value="">（暂无发布版）</option>';
+    return;
+  }
+  for (const p of data.publications) {
+    const opt = document.createElement('option');
+    opt.value = p.version;
+    opt.textContent = `v${p.version} · ${p.publishedAt}`;
+    sel.appendChild(opt);
+  }
+  await loadTrPieces();
+}
+
+async function loadTrPieces() {
+  const designId = Number(document.getElementById('trSourceDesign').value);
+  const version = Number(document.getElementById('trSourceVersion').value);
+  tr.sourcePub = null;
+  tr.selected.clear();
+  trInvalidate();
+  if (!designId || !version) { renderTrPieceList(); return; }
+  try {
+    const data = await api('GET', `/api/designs/${designId}/publications/${version}`);
+    tr.sourcePub = data.publication;
+    tr.selected = new Set(data.publication.snapshot.pieces.map((p) => p.pieceNo));
+  } catch (err) {
+    trBanner('error', '⛔ ' + err.message);
+  }
+  renderTrPieceList();
+}
+
+function renderTrPieceList() {
+  const ul = document.getElementById('trPieceList');
+  ul.innerHTML = '';
+  if (!tr.sourcePub) {
+    ul.innerHTML = '<li class="tr-empty">先选择来源图纸与发布版本，点击“加载拼片”。</li>';
+    return;
+  }
+  for (const pc of tr.sourcePub.snapshot.pieces) {
+    const li = document.createElement('li');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = tr.selected.has(pc.pieceNo);
+    cb.addEventListener('change', () => {
+      if (cb.checked) tr.selected.add(pc.pieceNo);
+      else tr.selected.delete(pc.pieceNo);
+      trInvalidate();
+    });
+    const sw = document.createElement('span');
+    sw.className = 'swatch';
+    sw.style.background = pc.color;
+    const label = document.createElement('span');
+    label.className = 'piece-meta';
+    label.innerHTML = `<span class="no">#${pc.pieceNo}</span><span class="area">${pc.area} mm²</span>`;
+    li.appendChild(cb);
+    li.appendChild(sw);
+    li.appendChild(label);
+    li.addEventListener('click', (e) => {
+      if (e.target === cb) return;
+      cb.checked = !cb.checked;
+      cb.dispatchEvent(new Event('change'));
+    });
+    ul.appendChild(li);
+  }
+}
+
+// 任何输入变化都使旧预览失效：必须重新预览才能确认
+function trInvalidate() {
+  tr.preview = null;
+  document.getElementById('trConfirmSection').hidden = true;
+}
+
+function trParams() {
+  return {
+    sourcePublicationId: tr.sourcePub ? tr.sourcePub.id : 0,
+    pieceNos: [...tr.selected].sort((a, b) => a - b),
+    rotation: Number(document.getElementById('trRotation').value),
+    dx: Number(document.getElementById('trDx').value),
+    dy: Number(document.getElementById('trDy').value),
+  };
+}
+
+async function previewTransfer() {
+  const targetId = Number(document.getElementById('trTargetDesign').value);
+  if (!tr.sourcePub) { trBanner('error', '⛔ 请先选择来源图纸与发布版本并加载拼片'); return; }
+  if (!tr.selected.size) { trBanner('error', '⛔ 请至少勾选一片拼片'); return; }
+  if (!targetId) { trBanner('error', '⛔ 请选择目标图纸'); return; }
+  const body = trParams();
+  try {
+    const data = await api('POST', `/api/designs/${targetId}/transfers/preview`, body);
+    tr.preview = data.preview;
+    renderTrPreview();
+    trBanner(false);
+  } catch (err) {
+    trInvalidate();
+    const d = err.data || {};
+    let txt = '⛔ ' + (d.error || err.message);
+    if (d.at) txt += `（位置：${d.at[0]}, ${d.at[1]}）`;
+    trBanner('error', txt);
+    document.getElementById('trDetail').innerHTML =
+      `<div class="stock-badge bad">${escapeHtml(txt)}</div>`;
+    renderTrCanvas();
+  }
+}
+
+function renderTrPreview() {
+  const p = tr.preview;
+  if (!p) return;
+  document.getElementById('trConfirmSection').hidden = false;
+  const cov = p.coverage;
+  const badge = cov.covered
+    ? '<span class="badge ok">✓ 转置后草稿完整覆盖，无空隙</span>'
+    : `<span class="badge bad">✗ 转置后草稿尚未完整覆盖（缺口 ${cov.gaps.length} 块${cov.overlapping.length ? `，重叠 ${cov.overlapping.length} 块` : ''}）</span>`;
+  document.getElementById('trPreviewSummary').innerHTML = `
+    <div class="muted">来源：${escapeHtml(p.source.designName)} v${p.source.version} →
+      目标：${escapeHtml(p.target.designName)}（${p.target.width}×${p.target.height}mm）<br>
+      旋转 ${p.transform.rotation}° · 平移 (${p.transform.dx}, ${p.transform.dy}) mm ·
+      共 ${p.pieces.length} 片，新编号 ${p.pieces.map((x) => '#' + x.targetPieceNo).join('、')}</div>
+    <div style="margin-top:6px">${badge}</div>`;
+
+  let html = `<table><thead><tr>
+    <th>源编号</th><th>新编号</th><th>颜色</th><th class="num">面积 mm²</th><th>目标位置（外接框左下-右上）</th>
+    </tr></thead><tbody>`;
+  for (const pc of p.pieces) {
+    const xs = pc.polygon.map((q) => q[0]);
+    const ys = pc.polygon.map((q) => q[1]);
+    html += `<tr>
+      <td>#${pc.sourcePieceNo}</td>
+      <td><b>#${pc.targetPieceNo}</b></td>
+      <td><span class="color-chip" style="background:${pc.color}"></span>${pc.color}</td>
+      <td class="num">${pc.area}</td>
+      <td class="small">(${Math.min(...xs)}, ${Math.min(...ys)}) – (${Math.max(...xs)}, ${Math.max(...ys)})</td>
+    </tr>`;
+  }
+  html += `</tbody></table>
+    <div class="muted" style="margin-top:6px">覆盖状态：拼片面积合计 ${cov.totalPieceArea} mm² /
+      窗框 ${cov.frameArea} mm²${cov.covered ? '，✓ 完整覆盖可发布' : '，未完整覆盖（可确认后继续编辑草稿）'}</div>`;
+  document.getElementById('trDetail').innerHTML = html;
+  renderTrCanvas();
+}
+
+async function confirmTransfer() {
+  const p = tr.preview;
+  if (!p) { trBanner('error', '⛔ 请先定位预览'); return; }
+  const body = { ...trParams(), previewToken: p.previewToken };
+  try {
+    const data = await api('POST', `/api/designs/${p.target.designId}/transfers`, body);
+    const nos = data.transfer.pieces.map((x) => `#${x.pieceNo}（源 #${x.sourcePieceNo}）`).join('、');
+    trBanner('success', `✓ 已写入目标草稿 ${data.transfer.pieces.length} 片：${nos}。` +
+      `当前草稿 ${data.draft.pieces.length} 片${data.draft.coverage.covered ? '，已完整覆盖可发布' : ''}。`);
+    trInvalidate();
+    document.getElementById('trDetail').innerHTML =
+      `<div class="stock-badge ok">✓ 转置完成：${escapeHtml(nos)}</div>
+       <div class="hint">新拼片已按现有草稿规则参与覆盖检查与铅条下料清单，可切到“草稿编辑”标签继续编辑或发布。</div>`;
+    renderTrCanvas();
+    await enterTransfer(); // 刷新图纸列表（片数）与目标草稿显示
+  } catch (err) {
+    const d = err.data || {};
+    if (d.code === 'draft_changed') {
+      trInvalidate();
+      trBanner('error', '⛔ 预览后目标草稿已被修改，请重新“定位预览”后再确认。');
+    } else {
+      let txt = '⛔ ' + (d.error || err.message);
+      if (d.at) txt += `（位置：${d.at[0]}, ${d.at[1]}）`;
+      trBanner('error', txt);
+    }
+  }
+}
+
+// ---------- 转置画布 ----------
+
+function renderTrCanvas() {
+  trCtx.clearRect(0, 0, trCanvas.width, trCanvas.height);
+  const p = tr.preview;
+  if (!p) {
+    trCtx.fillStyle = '#888';
+    trCtx.font = '15px sans-serif';
+    trCtx.textAlign = 'center';
+    trCtx.fillText('定位预览后在此显示目标窗框、已有拼片与待写入的转置拼片', trCanvas.width / 2, trCanvas.height / 2);
+    return;
+  }
+  const frame = { width: p.target.width, height: p.target.height };
+  const t = getTransform(frame, trCanvas);
+
+  trCtx.fillStyle = '#fbfaf7';
+  trCtx.fillRect(...t.toPx(0, frame.height), frame.width * t.scale, frame.height * t.scale);
+
+  // 覆盖缺口（红色斜纹）
+  if (!p.coverage.covered) {
+    for (const gap of p.coverage.gaps) trDrawGap(gap, t);
+    for (const ov of p.coverage.overlapping) trDrawOverlap(ov, t);
+  }
+
+  // 目标草稿已有拼片（浅色）
+  for (const pc of p.existingPieces) trDrawPiece(pc, t, { alpha: 0.4, label: `#${pc.pieceNo}` });
+  // 待写入的转置拼片（高亮虚线框）
+  for (const pc of p.pieces) {
+    trDrawPiece(pc, t, { alpha: 0.85, dashed: true, label: `新#${pc.targetPieceNo} ← 源#${pc.sourcePieceNo}` });
+  }
+
+  trCtx.strokeStyle = '#222';
+  trCtx.lineWidth = 3;
+  trCtx.strokeRect(...t.toPx(0, frame.height), frame.width * t.scale, frame.height * t.scale);
+}
+
+function trDrawPiece(pc, t, opt) {
+  const pts = pc.polygon.map(([x, y]) => t.toPx(x, y));
+  trCtx.beginPath();
+  trCtx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) trCtx.lineTo(pts[i][0], pts[i][1]);
+  trCtx.closePath();
+  trCtx.fillStyle = pc.color;
+  trCtx.globalAlpha = opt.alpha;
+  trCtx.fill();
+  trCtx.globalAlpha = 1;
+  trCtx.strokeStyle = opt.dashed ? '#0b3d91' : '#333';
+  trCtx.lineWidth = opt.dashed ? 2.4 : 1.4;
+  if (opt.dashed) trCtx.setLineDash([7, 4]);
+  trCtx.stroke();
+  trCtx.setLineDash([]);
+  const [cx0, cy0] = centroid(pc.polygon);
+  const [cx, cy] = t.toPx(cx0, cy0);
+  trCtx.font = 'bold 13px sans-serif';
+  const w = trCtx.measureText(opt.label).width;
+  trCtx.fillStyle = 'rgba(255,255,255,0.78)';
+  trCtx.fillRect(cx - w / 2 - 4, cy - 10, w + 8, 18);
+  trCtx.fillStyle = '#111';
+  trCtx.textAlign = 'center';
+  trCtx.textBaseline = 'middle';
+  trCtx.fillText(opt.label, cx, cy);
+}
+
+function trTracePath(rings, t) {
+  trCtx.beginPath();
+  for (const ring of rings) {
+    const pts = ring.map(([x, y]) => t.toPx(x, y));
+    trCtx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) trCtx.lineTo(pts[i][0], pts[i][1]);
+    trCtx.closePath();
+  }
+}
+
+function trDrawGap(gap, t) {
+  const rings = [gap.outer || gap.polygon, ...(gap.holes || [])];
+  trTracePath(rings, t);
+  trCtx.fillStyle = 'rgba(210, 40, 30, 0.18)';
+  trCtx.fill('evenodd');
+  trTracePath(rings, t);
+  trCtx.strokeStyle = '#c0281c';
+  trCtx.setLineDash([6, 4]);
+  trCtx.lineWidth = 2;
+  trCtx.stroke();
+  trCtx.setLineDash([]);
+}
+
+function trDrawOverlap(ov, t) {
+  trTracePath([ov.polygon], t);
+  trCtx.fillStyle = 'rgba(160, 0, 200, 0.2)';
+  trCtx.fill();
+  trCtx.strokeStyle = '#8b00b8';
+  trCtx.setLineDash([3, 3]);
+  trCtx.lineWidth = 2;
+  trCtx.stroke();
+  trCtx.setLineDash([]);
+}
+
+document.getElementById('tabTransfer').addEventListener('click', () => switchTab('transfer'));
+document.getElementById('trSourceDesign').addEventListener('change', loadTrVersions);
+document.getElementById('trSourceVersion').addEventListener('change', loadTrPieces);
+document.getElementById('btnTrLoadPieces').addEventListener('click', loadTrPieces);
+document.getElementById('btnTrSelectAll').addEventListener('click', () => {
+  if (!tr.sourcePub) return;
+  tr.selected = new Set(tr.sourcePub.snapshot.pieces.map((p) => p.pieceNo));
+  renderTrPieceList();
+  trInvalidate();
+});
+document.getElementById('btnTrSelectNone').addEventListener('click', () => {
+  tr.selected.clear();
+  renderTrPieceList();
+  trInvalidate();
+});
+document.getElementById('trTargetDesign').addEventListener('change', trInvalidate);
+document.getElementById('trRotation').addEventListener('change', trInvalidate);
+document.getElementById('trDx').addEventListener('input', trInvalidate);
+document.getElementById('trDy').addEventListener('input', trInvalidate);
+document.getElementById('btnTrPreview').addEventListener('click', previewTransfer);
+document.getElementById('btnTrConfirm').addEventListener('click', confirmTransfer);

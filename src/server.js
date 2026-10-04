@@ -8,6 +8,7 @@ const cut = require('./cutting');
 const leadDiff = require('./leaddiff');
 const printSheet = require('./printsheet');
 const sheetNest = require('./sheetnest');
+const pieceTransfer = require('./piecetransfer');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'studio.db');
@@ -206,6 +207,112 @@ app.delete('/api/designs/:designId/pieces/:pieceId', (req, res) => {
 function withArea(piece) {
   return { ...piece, area: geo.round2(geo.polygonArea(piece.polygon)) };
 }
+
+// ---------- 拼片转置（已发布快照 → 目标图纸草稿：旋转 + 整数平移，整批写入） ----------
+
+// 装载目标图纸、解析参数、装载来源发布版；任一失败时已写响应并返回 null。
+function loadTransferContext(req, res) {
+  const design = loadDesignOr404(req, res);
+  if (!design) return null;
+  const parsed = pieceTransfer.parseParams(req.body);
+  if (!parsed.ok) {
+    const { status, ...body } = parsed;
+    res.status(status).json(body);
+    return null;
+  }
+  const pub = db.getPublicationById(parsed.params.sourcePublicationId);
+  if (!pub) {
+    fail(res, 404, `来源发布版 id=${parsed.params.sourcePublicationId} 不存在`, { code: 'source_not_found' });
+    return null;
+  }
+  return { design, params: parsed.params, pub };
+}
+
+function transferMeta(design, pub, params) {
+  return {
+    source: {
+      publicationId: pub.id,
+      designId: pub.designId,
+      designName: pub.snapshot.name,
+      version: pub.version,
+    },
+    target: {
+      designId: design.id,
+      designName: design.name,
+      width: design.width_mm,
+      height: design.height_mm,
+    },
+    transform: { rotation: params.rotation, dx: params.dx, dy: params.dy },
+  };
+}
+
+// 预览：转换后的轮廓/颜色/目标位置与草稿覆盖状态；不写库、不改任何数据。
+// 返回 previewToken（目标草稿内容指纹），确认时原样带回。
+app.post('/api/designs/:designId/transfers/preview', (req, res) => {
+  const ctx = loadTransferContext(req, res);
+  if (!ctx) return;
+  const targetPieces = db.listPieces(ctx.design.id);
+  const batch = pieceTransfer.buildBatch(ctx.pub, ctx.design, targetPieces, ctx.params);
+  if (!batch.ok) {
+    const { status, ...body } = batch;
+    return res.status(status).json(body);
+  }
+  const startNo = targetPieces.reduce((m, p) => Math.max(m, p.pieceNo), 0) + 1;
+  res.json({
+    ok: true,
+    preview: {
+      ...transferMeta(ctx.design, ctx.pub, ctx.params),
+      existingPieces: targetPieces.map((p) => withArea(p)),
+      pieces: batch.pieces.map((p, i) => ({ ...p, targetPieceNo: startNo + i })),
+      coverage: batch.coverage,
+      previewToken: db.draftFingerprint(ctx.design.id),
+    },
+  });
+});
+
+// 确认：整批赋予目标图纸新编号并写入草稿（保留原色）。
+// 预览后目标草稿被编辑（指纹不符）→ 409 draft_changed，要求重新预览；
+// 任一拼片/来源版本不存在或几何冲突 → 指出对象与位置，整批不写入。
+app.post('/api/designs/:designId/transfers', (req, res) => {
+  const ctx = loadTransferContext(req, res);
+  if (!ctx) return;
+  const token = req.body?.previewToken;
+  if (typeof token !== 'string' || !token) {
+    return fail(res, 400, 'previewToken 必填：请先调用预览接口，并携带返回的 previewToken 确认', { code: 'token_required' });
+  }
+  // 草稿指纹不一致时几何结论已无意义，优先报冲突要求重新预览
+  if (token !== db.draftFingerprint(ctx.design.id)) {
+    return fail(res, 409, '预览后目标草稿已被修改，请重新预览后再确认', { code: 'draft_changed' });
+  }
+  const targetPieces = db.listPieces(ctx.design.id);
+  const batch = pieceTransfer.buildBatch(ctx.pub, ctx.design, targetPieces, ctx.params);
+  if (!batch.ok) {
+    const { status, ...body } = batch;
+    return res.status(status).json(body);
+  }
+  // 同事务复核指纹并整批插入（连续赋号）；源快照、生产单与库存不受影响
+  const result = db.addPiecesBatch(ctx.design.id, batch.pieces, token);
+  if (result.code === 'draft_changed') {
+    return fail(res, 409, '预览后目标草稿已被修改，请重新预览后再确认', { code: 'draft_changed' });
+  }
+  const pieces = result.pieces.map((p, i) => ({
+    id: p.id,
+    pieceNo: p.pieceNo,
+    sourcePieceNo: batch.pieces[i].sourcePieceNo,
+    color: p.color,
+    polygon: p.polygon,
+    area: geo.round2(geo.polygonArea(p.polygon)),
+  }));
+  res.status(201).json({
+    ok: true,
+    transfer: {
+      ...transferMeta(ctx.design, ctx.pub, ctx.params),
+      pieces,
+      coverage: batch.coverage,
+    },
+    draft: draftSummary(db.getDesign(ctx.design.id)),
+  });
+});
 
 // ---------- 发布 ----------
 

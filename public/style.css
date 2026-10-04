@@ -318,3 +318,28 @@ td.added.num, th.added.num { color: #2e7d4f; }
   padding: 1px 6px;
   border-radius: 4px;
 }
+
+/* ============ 拼片转置 ============ */
+.tr-piece-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.tr-piece-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 13px;
+  border-bottom: 1px solid #eee;
+  cursor: pointer;
+}
+.tr-piece-list li:last-child { border-bottom: none; }
+.tr-piece-list li:hover { background: #f2efe7; }
+.tr-piece-list input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; }
+.tr-piece-list .tr-empty { color: var(--muted); cursor: default; }
+.tr-piece-list .tr-empty:hover { background: none; }
