@@ -707,6 +707,7 @@ document.getElementById('btnPublish').addEventListener('click', publishDraft);
 function switchTab(which) {
   document.getElementById('tabDraft').classList.toggle('active', which === 'draft');
   document.getElementById('tabPublished').classList.toggle('active', which === 'published');
+  document.getElementById('tabReuse').classList.toggle('active', which === 'reuse');
   document.getElementById('tabDiff').classList.toggle('active', which === 'diff');
   document.getElementById('tabPrint').classList.toggle('active', which === 'print');
   document.getElementById('tabProduction').classList.toggle('active', which === 'production');
@@ -717,6 +718,7 @@ function switchTab(which) {
   document.getElementById('tabLedger').classList.toggle('active', which === 'ledger');
   document.getElementById('viewDraft').hidden = which !== 'draft';
   document.getElementById('viewPublished').hidden = which !== 'published';
+  document.getElementById('viewReuse').hidden = which !== 'reuse';
   document.getElementById('viewDiff').hidden = which !== 'diff';
   document.getElementById('viewPrint').hidden = which !== 'print';
   document.getElementById('viewProduction').hidden = which !== 'production';
@@ -726,6 +728,7 @@ function switchTab(which) {
   document.getElementById('viewIssue').hidden = which !== 'issue';
   document.getElementById('viewLedger').hidden = which !== 'ledger';
   if (which === 'published') loadPubVersions();
+  if (which === 'reuse') enterReuse();
   if (which === 'diff') enterDiff();
   if (which === 'print') enterPrint();
   if (which === 'production') enterProduction();
@@ -3096,3 +3099,419 @@ document.getElementById('ledgerType').addEventListener('change', () => {
   ledgerLoadSpecs().catch((e) => ledgerBanner('error', '⛔ ' + (e.data?.error || e.message)));
 });
 document.getElementById('btnLedgerQuery').addEventListener('click', () => { ledgerQuery(); });
+
+// ================= 跨图纸拼片复用（发布快照 → 目标草稿） =================
+
+const reuseState = {
+  srcDesigns: [],
+  srcPubs: null,       // 当前来源图纸的发布版列表
+  srcSnapshot: null,   // 当前选中发布版的 snapshot
+  targetDraft: null,   // GET 目标草稿
+  preview: null,       // 最近一次成功预览
+};
+
+const reuseCanvas = document.getElementById('reuseCanvas');
+const reuseCtx = reuseCanvas.getContext('2d');
+
+function reuseBanner(kind, msg) {
+  const el = document.getElementById('reuseBanner');
+  if (!msg) { el.hidden = true; el.textContent = ''; return; }
+  el.hidden = false;
+  el.className = `banner ${kind === 'error' ? 'error' : 'success'}`;
+  el.textContent = msg;
+}
+
+async function enterReuse() {
+  await reuseLoadDesigns();
+  await reuseLoadSourceVersions();
+  await reuseLoadPending();
+}
+
+async function reuseLoadDesigns() {
+  const data = await api('GET', '/api/designs');
+  reuseState.srcDesigns = data.designs;
+  for (const [selId, ph] of [
+    ['reuseSrcDesign', '来源图纸'],
+    ['reuseTargetDesign', '目标草稿'],
+  ]) {
+    const sel = document.getElementById(selId);
+    const prev = sel.value;
+    sel.innerHTML = '';
+    for (const d of data.designs) {
+      const opt = document.createElement('option');
+      opt.value = d.id;
+      opt.textContent = `${d.name}（${d.width}×${d.height}mm）`;
+      sel.appendChild(opt);
+    }
+    void ph;
+    if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  }
+  if (data.designs.length) await reuseLoadTargetDraft();
+}
+
+async function reuseLoadSourceVersions() {
+  const designId = document.getElementById('reuseSrcDesign').value;
+  const sel = document.getElementById('reuseSrcVersion');
+  sel.innerHTML = '';
+  reuseState.srcPubs = null;
+  reuseState.srcSnapshot = null;
+  if (!designId) { reuseRenderPieces(); return; }
+  const data = await api('GET', `/api/designs/${designId}/publications`);
+  reuseState.srcPubs = data.publications; // 倒序
+  if (!data.publications.length) {
+    sel.innerHTML = '<option value="">（暂无发布版）</option>';
+    reuseRenderPieces();
+    return;
+  }
+  for (const p of data.publications) {
+    const opt = document.createElement('option');
+    opt.value = p.version;
+    opt.textContent = `v${p.version} · ${p.publishedAt}`;
+    sel.appendChild(opt);
+  }
+  await reuseLoadSnapshot();
+}
+
+async function reuseLoadSnapshot() {
+  const designId = document.getElementById('reuseSrcDesign').value;
+  const version = document.getElementById('reuseSrcVersion').value;
+  if (!designId || !version) { reuseState.srcSnapshot = null; reuseRenderPieces(); return; }
+  const data = await api('GET', `/api/designs/${designId}/publications/${version}`);
+  reuseState.srcSnapshot = data.publication;
+  reuseRenderPieces();
+  reuseRenderCanvas();
+}
+
+function reuseRenderPieces() {
+  const ul = document.getElementById('reusePieceList');
+  ul.innerHTML = '';
+  const snap = reuseState.srcSnapshot?.snapshot;
+  if (!snap) {
+    ul.innerHTML = '<li class="hint">来源图纸还没有已发布版本。</li>';
+    return;
+  }
+  for (const pc of snap.pieces) {
+    const li = document.createElement('li');
+    li.innerHTML = `<label><input type="checkbox" value="${pc.pieceNo}">
+      <span class="swatch" style="background:${pc.color}"></span>
+      <span><b>#${pc.pieceNo}</b> · ${pc.area} mm²</span></label>`;
+    li.querySelector('input').addEventListener('change', () => {
+      // 选择变化只影响下一次预览，不自动请求
+      reuseBanner(false);
+    });
+    ul.appendChild(li);
+  }
+}
+
+async function reuseLoadTargetDraft() {
+  const id = document.getElementById('reuseTargetDesign').value;
+  if (!id) { reuseState.targetDraft = null; reuseRenderCanvas(); return; }
+  const data = await api('GET', `/api/designs/${id}`);
+  reuseState.targetDraft = data.draft;
+  reuseRenderCanvas();
+}
+
+function reuseCollectPieceNos() {
+  return [...document.querySelectorAll('#reusePieceList input:checked')]
+    .map((c) => Number(c.value))
+    .sort((a, b) => a - b);
+}
+
+async function reuseRunPreview() {
+  reuseBanner(false);
+  const targetId = Number(document.getElementById('reuseTargetDesign').value);
+  const srcDesignId = Number(document.getElementById('reuseSrcDesign').value);
+  const srcVersion = Number(document.getElementById('reuseSrcVersion').value);
+  const pieceNos = reuseCollectPieceNos();
+  const rotation = Number(document.getElementById('reuseRotation').value);
+  const dx = Number(document.getElementById('reuseDx').value);
+  const dy = Number(document.getElementById('reuseDy').value);
+  if (!targetId || !srcDesignId || !srcVersion) {
+    reuseBanner('error', '请先选择来源图纸、发布版本和目标草稿');
+    return;
+  }
+  if (!pieceNos.length) {
+    reuseBanner('error', '请至少勾选一片拼片');
+    return;
+  }
+  try {
+    const data = await api('POST', `/api/designs/${targetId}/imports/preview`, {
+      sourceDesignId: srcDesignId,
+      sourceVersion: srcVersion,
+      pieceNos, rotation, dx, dy,
+    });
+    reuseState.preview = data.preview;
+    reuseRenderResult(data.preview, null);
+    reuseRenderCanvas();
+    await reuseLoadPending();
+    reuseBanner('success', `预览 #${data.preview.id} 已生成（未写入）：核对无误后点“确认整批导入”。`);
+  } catch (err) {
+    reuseState.preview = null;
+    const d = err.data || {};
+    if (d.code === 'geometry_conflict' && Array.isArray(d.problems)) {
+      reuseRenderResult(null, d.problems);
+      reuseRenderCanvas(d.problems);
+    } else {
+      reuseRenderResult(null, null, err.message);
+      reuseRenderCanvas();
+    }
+    reuseBanner('error', '⛔ ' + (d.error || err.message));
+  }
+}
+
+function reuseCoverageBadge(cov) {
+  if (!cov) return '';
+  if (cov.covered) return '<span class="badge ok">✓ 完整覆盖，无空隙</span>';
+  const gapN = cov.gaps.length;
+  const ovN = cov.overlapping.length;
+  return `<span class="badge bad">✗ 缺口 ${gapN} 块${ovN ? `、重叠 ${ovN} 处` : ''}</span>`;
+}
+
+function reuseRenderResult(pv, problems, errorText) {
+  const box = document.getElementById('reuseResult');
+  if (errorText) { box.className = 'hint'; box.textContent = errorText; return; }
+  if (problems) {
+    box.className = '';
+    let html = '<div class="badge bad" style="margin-bottom:8px">几何冲突，整批未写入</div><table><thead><tr><th>来源片</th><th>问题</th><th>位置 (mm)</th><th>冲突对象</th></tr></thead><tbody>';
+    for (const p of problems) {
+      const who = p.withKind === 'existing' ? `目标已有片 #${p.withPieceNo}`
+        : p.withKind === 'import' ? `本批来源片 #${p.withPieceNo}` : '—';
+      const reason = p.reason === 'out_of_frame' ? '超出目标窗框'
+        : p.reason === 'invalid_polygon' ? '多边形不合法' : '面积重叠';
+      html += `<tr><td>#${p.sourcePieceNo}</td><td>${reason}</td>` +
+        `<td>${p.at ? `(${p.at[0]}, ${p.at[1]})` : '—'}</td><td>${who}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    box.innerHTML = html;
+    return;
+  }
+  if (!pv) { box.className = 'hint'; box.textContent = '尚未生成预览。'; return; }
+  box.className = '';
+  let html = `<div style="margin-bottom:8px">
+      来源：<b>${escapeHtml(pv.source.designName)}</b> v${pv.source.version}
+      （发布版 #${pv.source.publicationId}） → 目标图纸 #${pv.target.designId}
+      （${pv.target.width}×${pv.target.height} mm）<br>
+      旋转 ${pv.rotation}° · 平移 (${pv.dx}, ${pv.dy}) mm · 共 ${pv.items.length} 片
+    </div>
+    <table><thead><tr><th>新序</th><th>来源片</th><th>颜色</th><th>外接范围 (mm)</th><th>面积 mm²</th></tr></thead><tbody>`;
+  pv.items.forEach((it, i) => {
+    html += `<tr><td>${i + 1}</td><td>#${it.sourcePieceNo}</td>
+      <td><span class="color-chip" style="background:${it.color}"></span>${it.color}</td>
+      <td>x ${it.bounds.minX}–${it.bounds.maxX}, y ${it.bounds.minY}–${it.bounds.maxY}</td>
+      <td class="num">${it.area}</td></tr>`;
+  });
+  html += '</tbody></table><div style="margin-top:10px; display:flex; gap:16px; flex-wrap:wrap">' +
+    `<div>预览前目标草稿：${pv.targetDraft.pieceCount} 片 ${reuseCoverageBadge(pv.targetDraft.coverage)}</div>` +
+    `<div>导入后模拟：${pv.simulated.pieceCount} 片 ${reuseCoverageBadge(pv.simulated.coverage)}</div></div>` +
+    `<div class="btn-row" style="margin-top:12px">
+      <button class="primary" onclick="reuseConfirm(${pv.id})">确认整批导入（整批写入）</button>
+      <button class="danger" onclick="reuseDelete(${pv.id})">放弃此预览</button>
+    </div>
+    <div class="hint">确认后这些拼片整批赋予目标图纸新编号并保留原色；源发布快照、生产单与库存均不变。</div>`;
+  box.innerHTML = html;
+}
+
+async function reuseConfirm(id) {
+  const targetId = Number(document.getElementById('reuseTargetDesign').value);
+  try {
+    const data = await api('POST', `/api/designs/${targetId}/imports/${id}/confirm`);
+    reuseBanner('success',
+      `已整批导入 ${data.addedPieces.length} 片：新编号 ${data.addedPieces.map((p) => `#${p.pieceNo}`).join('、')}，颜色保留。`);
+    reuseState.preview = null;
+    reuseRenderResult(null, null);
+    document.querySelectorAll('#reusePieceList input:checked').forEach((c) => { c.checked = false; });
+    await Promise.all([reuseLoadTargetDraft(), reuseLoadPending()]);
+    // 草稿编辑标签也刷新，便于继续编辑/发布
+    if (Number(document.getElementById('designSelect').value) === targetId) {
+      await loadDraft(targetId);
+    }
+  } catch (err) {
+    const d = err.data || {};
+    reuseBanner('error', '⛔ ' + (d.error || err.message));
+    if (d.code === 'draft_changed') {
+      reuseRenderResult(null, null, '目标草稿在预览后已被编辑：请重新点击“定位预览”再确认。');
+    } else if (d.code === 'geometry_conflict') {
+      reuseRenderResult(null, d.problems);
+      reuseRenderCanvas(d.problems);
+    }
+    await reuseLoadPending();
+  }
+}
+
+async function reuseDelete(id) {
+  const targetId = Number(document.getElementById('reuseTargetDesign').value);
+  try {
+    await api('DELETE', `/api/designs/${targetId}/imports/${id}`);
+    if (reuseState.preview?.id === id) {
+      reuseState.preview = null;
+      reuseRenderResult(null, null);
+      reuseRenderCanvas();
+    }
+    await reuseLoadPending();
+    reuseBanner('success', '预览已删除（未写入任何拼片）。');
+  } catch (err) {
+    reuseBanner('error', '⛔ ' + err.message);
+  }
+}
+
+async function reuseLoadPending() {
+  const section = document.getElementById('reusePendingSection');
+  const box = document.getElementById('reusePendingList');
+  const targetId = Number(document.getElementById('reuseTargetDesign').value);
+  if (!targetId) { section.hidden = true; return; }
+  const data = await api('GET', `/api/designs/${targetId}/imports?status=pending`);
+  const pending = data.imports;
+  if (!pending.length) { section.hidden = true; box.innerHTML = ''; return; }
+  section.hidden = false;
+  box.innerHTML = pending.map((p) => {
+    const stale = false; // 列表不做逐行 stale 探测；打开确认时服务端权威判定
+    void stale;
+    return `<div class="reuse-item">
+      <b>预览 #${p.id}</b> · 来源 v${p.sourceVersion} · ${p.pieceNos.length} 片
+      （#${p.pieceNos.join(', #')}）<br>
+      旋转 ${p.rotation}° · 平移 (${p.dx}, ${p.dy}) mm · ${p.createdAt}
+      <div class="btn-row">
+        <button class="primary" onclick="reuseOpenPending(${p.id})">载入到画布</button>
+        <button class="danger" onclick="reuseDelete(${p.id})">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function reuseOpenPending(id) {
+  const targetId = Number(document.getElementById('reuseTargetDesign').value);
+  try {
+    const data = await api('GET', `/api/designs/${targetId}/imports/${id}`);
+    const p = data.pieceImport;
+    // 还原表单与勾选
+    const srcSel = document.getElementById('reuseSrcDesign');
+    if ([...srcSel.options].some((o) => Number(o.value) === p.sourceDesignId)) {
+      srcSel.value = String(p.sourceDesignId);
+      await reuseLoadSourceVersions();
+    }
+    document.getElementById('reuseSrcVersion').value = String(p.sourceVersion);
+    await reuseLoadSnapshot();
+    document.getElementById('reuseRotation').value = String(p.rotation);
+    document.getElementById('reuseDx').value = p.dx;
+    document.getElementById('reuseDy').value = p.dy;
+    document.querySelectorAll('#reusePieceList input').forEach((c) => {
+      c.checked = p.pieceNos.includes(Number(c.value));
+    });
+    const pv = {
+      id: p.id,
+      status: p.status,
+      target: { designId: targetId, width: reuseState.targetDraft.width, height: reuseState.targetDraft.height },
+      source: { publicationId: p.publicationId, designId: p.sourceDesignId, version: p.sourceVersion,
+        designName: reuseState.srcSnapshot?.snapshot?.name || `图纸 #${p.sourceDesignId}` },
+      selection: p.pieceNos, rotation: p.rotation, dx: p.dx, dy: p.dy,
+      items: p.items, draftToken: p.draftFingerprint,
+      targetDraft: { pieceCount: reuseState.targetDraft.pieces.length, coverage: reuseState.targetDraft.coverage },
+      simulated: { pieceCount: null, coverage: null },
+    };
+    // 服务端已给 stale
+    reuseState.preview = pv;
+    reuseRenderResult(pv, null);
+    reuseRenderCanvas();
+    if (data.stale) {
+      reuseBanner('error', '该预览生成后目标草稿已被编辑，不能直接确认；请重新点击“定位预览”。');
+    } else {
+      reuseBanner('success', `已载入待确认预览 #${p.id}。`);
+    }
+  } catch (err) {
+    reuseBanner('error', '⛔ ' + err.message);
+  }
+}
+
+// 画布：以目标窗框为坐标系，淡色画已有片，蓝边半透明画导入片，红 ✕ 画冲突位置
+function reuseRenderCanvas(problems) {
+  reuseCtx.clearRect(0, 0, reuseCanvas.width, reuseCanvas.height);
+  const d = reuseState.targetDraft;
+  if (!d) return;
+  const t = getTransform(d, reuseCanvas);
+
+  reuseCtx.fillStyle = '#fbfaf7';
+  reuseCtx.fillRect(...t.toPx(0, d.height), d.width * t.scale, d.height * t.scale);
+
+  for (const pc of d.pieces) {
+    const pts = pc.polygon.map(([x, y]) => t.toPx(x, y));
+    reuseCtx.beginPath();
+    reuseCtx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) reuseCtx.lineTo(pts[i][0], pts[i][1]);
+    reuseCtx.closePath();
+    reuseCtx.fillStyle = pc.color;
+    reuseCtx.globalAlpha = 0.35;
+    reuseCtx.fill();
+    reuseCtx.globalAlpha = 1;
+    reuseCtx.strokeStyle = '#777';
+    reuseCtx.lineWidth = 1.2;
+    reuseCtx.stroke();
+  }
+
+  const pv = reuseState.preview;
+  if (pv && Array.isArray(pv.items)) {
+    pv.items.forEach((it, i) => {
+      const pts = it.polygon.map(([x, y]) => t.toPx(x, y));
+      reuseCtx.beginPath();
+      reuseCtx.moveTo(pts[0][0], pts[0][1]);
+      for (let j = 1; j < pts.length; j++) reuseCtx.lineTo(pts[j][0], pts[j][1]);
+      reuseCtx.closePath();
+      reuseCtx.fillStyle = it.color;
+      reuseCtx.globalAlpha = 0.7;
+      reuseCtx.fill();
+      reuseCtx.globalAlpha = 1;
+      reuseCtx.strokeStyle = '#1565c0';
+      reuseCtx.lineWidth = 2.2;
+      reuseCtx.stroke();
+      const [cx0, cy0] = centroid(it.polygon);
+      const [cx, cy] = t.toPx(cx0, cy0);
+      reuseCtx.font = 'bold 13px sans-serif';
+      reuseCtx.textAlign = 'center';
+      reuseCtx.textBaseline = 'middle';
+      reuseCtx.fillStyle = 'rgba(255,255,255,0.85)';
+      const label = `新${i + 1}←#${it.sourcePieceNo}`;
+      const w = reuseCtx.measureText(label).width;
+      reuseCtx.fillRect(cx - w / 2 - 4, cy - 9, w + 8, 18);
+      reuseCtx.fillStyle = '#0b3d70';
+      reuseCtx.fillText(label, cx, cy);
+    });
+  }
+
+  // 冲突问题位置（红 ✕）
+  if (Array.isArray(problems)) {
+    for (const p of problems) {
+      if (!p.at) continue;
+      const [x, y] = t.toPx(p.at[0], p.at[1]);
+      reuseCtx.beginPath();
+      reuseCtx.arc(x, y, 9, 0, Math.PI * 2);
+      reuseCtx.strokeStyle = '#d32f2f';
+      reuseCtx.lineWidth = 3;
+      reuseCtx.stroke();
+      reuseCtx.beginPath();
+      reuseCtx.moveTo(x - 5, y - 5); reuseCtx.lineTo(x + 5, y + 5);
+      reuseCtx.moveTo(x + 5, y - 5); reuseCtx.lineTo(x - 5, y + 5);
+      reuseCtx.strokeStyle = '#d32f2f';
+      reuseCtx.lineWidth = 2.5;
+      reuseCtx.stroke();
+    }
+  }
+
+  reuseCtx.strokeStyle = '#222';
+  reuseCtx.lineWidth = 3;
+  reuseCtx.strokeRect(...t.toPx(0, d.height), d.width * t.scale, d.height * t.scale);
+}
+
+window.reuseConfirm = reuseConfirm;
+window.reuseDelete = reuseDelete;
+window.reuseOpenPending = reuseOpenPending;
+
+document.getElementById('tabReuse').addEventListener('click', () => switchTab('reuse'));
+document.getElementById('reuseSrcDesign').addEventListener('change', reuseLoadSourceVersions);
+document.getElementById('reuseSrcVersion').addEventListener('change', reuseLoadSnapshot);
+document.getElementById('reuseTargetDesign').addEventListener('change', async () => {
+  await reuseLoadTargetDraft();
+  await reuseLoadPending();
+});
+document.getElementById('btnReusePreview').addEventListener('click', () => {
+  reuseRunPreview().catch((e) => reuseBanner('error', '⛔ ' + (e.data?.error || e.message)));
+});
+

@@ -8,6 +8,7 @@ const cut = require('./cutting');
 const leadDiff = require('./leaddiff');
 const printSheet = require('./printsheet');
 const sheetNest = require('./sheetnest');
+const importPieces = require('./importpieces');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'studio.db');
@@ -397,6 +398,205 @@ app.get('/api/designs/:designId/publications/:version', (req, res) => {
   const pub = db.getPublicationByVersion(design.id, Number(req.params.version));
   if (!pub) return fail(res, 404, '发布版不存在');
   res.json({ ok: true, publication: pub });
+});
+
+// ---------- 跨图纸拼片复用（已发布快照 → 目标图纸草稿，预览后确认整批写入） ----------
+
+// 解析来源发布版：优先全局 publicationId；否则 sourceDesignId + 版本号（目标图纸外的版本号）。
+// 返回 { pub } 或由调用方用 res 直接报错。
+function resolveSourcePublication(res, p) {
+  if (p.publicationId !== null) {
+    const pub = db.getPublicationById(p.publicationId);
+    if (!pub) {
+      fail(res, 404, `来源发布版 id=${p.publicationId} 不存在`, { code: 'source_not_found' });
+      return null;
+    }
+    return pub;
+  }
+  const sourceDesign = db.getDesign(p.sourceDesignId);
+  if (!sourceDesign) {
+    fail(res, 404, `来源图纸 #${p.sourceDesignId} 不存在`, { code: 'source_not_found' });
+    return null;
+  }
+  const pub = db.getPublicationByVersion(p.sourceDesignId, p.sourceVersion);
+  if (!pub) {
+    fail(res, 404, `来源图纸 #${p.sourceDesignId} 的发布版 v${p.sourceVersion} 不存在`,
+      { code: 'source_not_found' });
+    return null;
+  }
+  return pub;
+}
+
+// 仅对 pending 预览返回行，否则给出对应错误
+function loadPendingImportOrReject(res, id) {
+  const rec = db.getPieceImportRow(id);
+  if (!rec) { fail(res, 404, '复用预览不存在'); return null; }
+  if (rec.status === 'confirmed') {
+    res.status(409).json({
+      ok: false, code: 'already_confirmed',
+      error: '该复用预览已确认，不能重复确认；如需再次导入请重新预览',
+      pieceImport: db.getPieceImport(id),
+    });
+    return null;
+  }
+  return rec;
+}
+
+// POST /api/designs/:designId/imports/preview
+//   { publicationId } 或 { sourceDesignId, sourceVersion }
+//   { pieceNos:[...不重复来源片号], rotation:0|90|180|270, dx,dy 整数毫米 }
+// 预览落库（pending）但不写拼片；返回转换后轮廓/颜色/目标位置、目标草稿与模拟覆盖状态。
+app.post('/api/designs/:designId/imports/preview', (req, res) => {
+  const design = loadDesignOr404(req, res);
+  if (!design) return;
+  const parsed = importPieces.parseImportBody(req.body || {});
+  if (!parsed.ok) return fail(res, 400, parsed.error);
+  const p = parsed.params;
+  const pub = resolveSourcePublication(res, p);
+  if (!pub) return;
+
+  const existingPieces = db.listPieces(design.id);
+  const built = importPieces.buildPreview(design, existingPieces, pub, p);
+  if (!built.ok) {
+    if (built.code === 'source_piece_not_found') {
+      return res.status(404).json({
+        ok: false,
+        code: 'source_piece_not_found',
+        error: `来源发布版（${pub.snapshot.name} v${pub.version}）中不存在拼片编号：${built.missing.map((n) => `#${n}`).join('、')}`,
+        source: { publicationId: pub.id, designId: pub.designId, version: pub.version },
+        missing: built.missing,
+      });
+    }
+    // geometry_conflict
+    return res.status(422).json({
+      ok: false,
+      code: 'geometry_conflict',
+      error: '转换后存在几何冲突（越界或面积重叠），整批未写入；请调整旋转/平移或改选拼片后重新预览',
+      problems: built.problems,
+    });
+  }
+
+  const rec = db.createPieceImport({
+    targetDesignId: design.id,
+    publicationId: pub.id,
+    sourceDesignId: pub.designId,
+    sourceVersion: pub.version,
+    rotation: p.rotation,
+    dx: p.dx,
+    dy: p.dy,
+    pieceNos: p.pieceNos,
+    items: built.previewData.items.map((it) => ({
+      index: it.index,
+      sourcePieceNo: it.sourcePieceNo,
+      color: it.color,
+      rotation: it.rotation,
+      dx: it.dx,
+      dy: it.dy,
+      polygon: it.polygon,
+      bounds: it.bounds,
+      area: it.area,
+    })),
+    draftFingerprint: built.previewData.draftToken,
+  });
+  res.status(201).json({
+    ok: true,
+    preview: {
+      id: rec.id,
+      status: rec.status,
+      ...built.previewData,
+      draftToken: rec.draftFingerprint,
+    },
+  });
+});
+
+// GET /api/designs/:designId/imports —— 复用预览列表（pending 在前？默认全部，按 id 倒序）
+app.get('/api/designs/:designId/imports', (req, res) => {
+  const design = loadDesignOr404(req, res);
+  if (!design) return;
+  const status = req.query.status;
+  if (status !== undefined && status !== 'pending' && status !== 'confirmed') {
+    return fail(res, 400, 'status 只能是 pending 或 confirmed');
+  }
+  const imports = db.listPieceImports({ targetDesignId: design.id, ...(status ? { status } : {}) });
+  res.json({ ok: true, imports });
+});
+
+// GET /api/designs/:designId/imports/:importId —— 单个预览/确认结果（页面刷新后恢复）
+app.get('/api/designs/:designId/imports/:importId', (req, res) => {
+  const design = loadDesignOr404(req, res);
+  if (!design) return;
+  const importId = Number(req.params.importId);
+  if (!Number.isInteger(importId) || importId <= 0) return fail(res, 400, '导入预览 id 必须是正整数');
+  const rec = db.getPieceImport(importId);
+  if (!rec || rec.targetDesignId !== design.id) return fail(res, 404, '复用预览不存在');
+  const stale = rec.status === 'pending' &&
+    rec.draftFingerprint !== importPieces.draftFingerprint(db.listPieces(design.id));
+  res.json({ ok: true, pieceImport: rec, stale });
+});
+
+// POST /api/designs/:designId/imports/:importId/confirm —— 整批确认
+//   同事务重核草稿指纹与几何；通过则整批赋予目标图纸新编号（保留原色）。
+app.post('/api/designs/:designId/imports/:importId/confirm', (req, res) => {
+  const design = loadDesignOr404(req, res);
+  if (!design) return;
+  const importId = Number(req.params.importId);
+  if (!Number.isInteger(importId) || importId <= 0) return fail(res, 400, '导入预览 id 必须是正整数');
+  const rec = loadPendingImportOrReject(res, importId);
+  if (!rec) return;
+  if (rec.target_design_id !== design.id) return fail(res, 404, '复用预览不属于该图纸');
+
+  const result = db.confirmPieceImport(importId, {
+    checkFingerprint: (existingPieces, expected) =>
+      importPieces.draftFingerprint(existingPieces) === expected,
+    checkGeometry: (frame, existingPieces, items) =>
+      importPieces.validateBatch(frame, existingPieces, items),
+  });
+
+  if (result.code === 'ok') {
+    return res.status(201).json({
+      ok: true,
+      pieceImport: result.pieceImport,
+      addedPieces: result.confirmedPieces,
+      draft: draftSummary(db.getDesign(design.id)),
+    });
+  }
+  if (result.code === 'already_confirmed') {
+    return res.status(409).json({
+      ok: false, code: 'already_confirmed',
+      error: '该复用预览已确认，不能重复确认；如需再次导入请重新预览',
+      pieceImport: result.pieceImport,
+    });
+  }
+  if (result.code === 'draft_changed') {
+    return res.status(409).json({
+      ok: false, code: 'draft_changed',
+      error: '目标草稿在预览后已被编辑（新增/修改/删除拼片），请重新预览后再确认；整批未写入',
+    });
+  }
+  if (result.code === 'geometry_conflict') {
+    return res.status(422).json({
+      ok: false, code: 'geometry_conflict',
+      error: '目标草稿当前状态下转换后拼片存在几何冲突，整批未写入；请重新预览',
+      problems: result.problems,
+    });
+  }
+  if (result.code === 'target_not_found') return fail(res, 404, '目标图纸不存在');
+  return fail(res, 500, '确认失败');
+});
+
+// DELETE /api/designs/:designId/imports/:importId —— 仅可删除 pending 预览
+app.delete('/api/designs/:designId/imports/:importId', (req, res) => {
+  const design = loadDesignOr404(req, res);
+  if (!design) return;
+  const importId = Number(req.params.importId);
+  if (!Number.isInteger(importId) || importId <= 0) return fail(res, 400, '导入预览 id 必须是正整数');
+  const rec = db.getPieceImport(importId);
+  if (!rec || rec.targetDesignId !== design.id) return fail(res, 404, '复用预览不存在');
+  const r = db.deletePieceImport(importId);
+  if (r.code === 'not_pending') {
+    return fail(res, 409, '已确认的复用记录永久保留，不能删除');
+  }
+  res.json({ ok: true });
 });
 
 // ---------- 铅条原材库存 ----------

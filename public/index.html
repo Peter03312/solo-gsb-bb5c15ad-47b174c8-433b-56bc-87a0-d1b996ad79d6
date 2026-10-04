@@ -12,6 +12,7 @@
     <nav class="tabs">
       <button id="tabDraft" class="tab active">草稿编辑</button>
       <button id="tabPublished" class="tab">已发布图纸</button>
+      <button id="tabReuse" class="tab">跨图复用</button>
       <button id="tabDiff" class="tab">版本核对</button>
       <button id="tabPrint" class="tab">分张打印</button>
       <button id="tabProduction" class="tab">铅条生产</button>
@@ -115,6 +116,62 @@
     </aside>
     <section class="canvas-wrap">
       <canvas id="pubCanvas" width="900" height="640"></canvas>
+    </section>
+  </main>
+
+  <!-- ============ 跨图复用视图 ============ -->
+  <main id="viewReuse" class="view" hidden>
+    <aside class="panel">
+      <section>
+        <h2>① 选择来源发布版与拼片</h2>
+        <label>来源图纸
+          <select id="reuseSrcDesign"></select>
+        </label>
+        <label>已发布版本
+          <select id="reuseSrcVersion"></select>
+        </label>
+        <div class="hint">至少勾选一片且不重复；颜色来自不可变发布快照，导入后保留原色。</div>
+        <ul id="reusePieceList" class="reuse-pieces"></ul>
+      </section>
+
+      <section>
+        <h2>② 目标草稿与定位</h2>
+        <label>目标图纸草稿
+          <select id="reuseTargetDesign"></select>
+        </label>
+        <div class="form-row">
+          <label>旋转（绕来源图纸坐标原点，逆时针）
+            <select id="reuseRotation">
+              <option value="0">0°</option>
+              <option value="90">90°</option>
+              <option value="180">180°</option>
+              <option value="270">270°</option>
+            </select>
+          </label>
+        </div>
+        <div class="form-row two">
+          <label>x 平移 dx (mm)<input id="reuseDx" type="number" step="1" value="0"></label>
+          <label>y 平移 dy (mm)<input id="reuseDy" type="number" step="1" value="0"></label>
+        </div>
+        <div class="btn-row">
+          <button id="btnReusePreview" class="primary big">定位预览（不写入）</button>
+        </div>
+        <div id="reuseMsg" class="hint">拼片先绕来源图纸的坐标原点旋转 0/90/180/270°，再做整数毫米平移。预览只显示转换后的轮廓、原色、目标位置与草稿覆盖状态；确认时整批赋予目标图纸新编号。</div>
+      </section>
+
+      <section id="reusePendingSection" hidden>
+        <h2>③ 待确认预览</h2>
+        <div id="reusePendingList"></div>
+      </section>
+    </aside>
+
+    <section class="canvas-wrap">
+      <div id="reuseBanner" class="banner" hidden></div>
+      <canvas id="reuseCanvas" width="900" height="640"></canvas>
+      <div class="lead-panel">
+        <h2>预览结果</h2>
+        <div id="reuseResult" class="hint">左侧选择来源图纸、发布版本与至少一片拼片，选择目标草稿并设置旋转/平移后点击“定位预览”。</div>
+      </div>
     </section>
   </main>
 

@@ -299,6 +299,21 @@ td.added.num, th.added.num { color: #2e7d4f; }
   padding: 0 2px;
 }
 
+/* ============ 跨图复用 ============ */
+.reuse-pieces { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; }
+.reuse-pieces li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 2px; font-size: 13px; border-bottom: 1px solid #eee;
+}
+.reuse-pieces label { display: flex; align-items: center; gap: 8px; margin: 0; width: 100%; cursor: pointer; }
+.reuse-pieces input[type="checkbox"] { width: auto; margin: 0; }
+.reuse-item {
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  margin-bottom: 6px; font-size: 13px; line-height: 1.6; background: #fcfbf8;
+}
+.reuse-item .btn-row { margin: 6px 0 0; }
+.reuse-imported { stroke: #1565c0; }
+
 /* ============ 领料 ============ */
 .issue-records {
   list-style: none;

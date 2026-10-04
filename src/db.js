@@ -237,6 +237,33 @@ function init(dbPath) {
     CREATE INDEX IF NOT EXISTS idx_issues_mat    ON stock_issues(material_id);
     CREATE INDEX IF NOT EXISTS idx_issues_sheet  ON stock_issues(sheet_id);
     CREATE INDEX IF NOT EXISTS idx_issues_no     ON stock_issues(issue_no);
+
+    -- 跨图纸拼片复用预览：从一份已发布快照选片（piece_nos），绕源图纸原点旋转
+    -- 0/90/180/270 并整数毫米平移后准备写入目标图纸草稿。
+    -- 预览即落库（status=pending），保存目标草稿指纹 draft_fingerprint；
+    -- 确认时在同一写事务内重算指纹——预览后草稿被编辑（增删改任一片）则指纹不符，
+    -- 返回 409 draft_changed 整批不写入，须重新预览。确认成功后 status=confirmed，
+    -- 整批拼片在同一事务内赋予目标图纸的新编号（保留原色），本记录不可再确认。
+    CREATE TABLE IF NOT EXISTS piece_imports (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      status            TEXT    NOT NULL CHECK (status IN ('pending','confirmed')),
+      target_design_id  INTEGER NOT NULL REFERENCES designs(id) ON DELETE CASCADE,
+      publication_id    INTEGER NOT NULL REFERENCES publications(id),
+      source_design_id  INTEGER NOT NULL,
+      source_version    INTEGER NOT NULL,
+      rotation          INTEGER NOT NULL CHECK (rotation IN (0,90,180,270)),
+      dx_mm             INTEGER NOT NULL,
+      dy_mm             INTEGER NOT NULL,
+      piece_nos         TEXT    NOT NULL,           -- JSON [来源片号...]（不重复）
+      items             TEXT    NOT NULL,           -- JSON：逐片来源编号/原色/旋转/平移/转换后轮廓
+      draft_fingerprint TEXT    NOT NULL,           -- 预览时目标草稿指纹
+      created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+      confirmed_at      TEXT,
+      confirmed_pieces  TEXT                        -- 确认后 JSON：[{pieceNo,sourcePieceNo,color,polygon}]
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_pieceimports_design ON piece_imports(target_design_id);
+    CREATE INDEX IF NOT EXISTS idx_pieceimports_status ON piece_imports(status);
   `);
 
   // 旧库迁移：早期 cut_orders 的状态 CHECK 不含 'replaced'，也没有 replaced_at 列。
@@ -2213,6 +2240,144 @@ function listLedgerEntries({ materialType, specId, from = null, to = null }) {
     .all(...args);
 }
 
+// ---------- 跨图纸拼片复用 ----------
+
+function rowToPieceImport(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    status: row.status,
+    targetDesignId: row.target_design_id,
+    publicationId: row.publication_id,
+    sourceDesignId: row.source_design_id,
+    sourceVersion: row.source_version,
+    rotation: row.rotation,
+    dx: row.dx_mm,
+    dy: row.dy_mm,
+    pieceNos: JSON.parse(row.piece_nos),
+    items: JSON.parse(row.items),
+    draftFingerprint: row.draft_fingerprint,
+    createdAt: row.created_at,
+    confirmedAt: row.confirmed_at || null,
+    confirmedPieces: row.confirmed_pieces ? JSON.parse(row.confirmed_pieces) : null,
+  };
+}
+
+function createPieceImport(rec) {
+  const info = getDb()
+    .prepare(`INSERT INTO piece_imports
+      (status, target_design_id, publication_id, source_design_id, source_version,
+       rotation, dx_mm, dy_mm, piece_nos, items, draft_fingerprint)
+      VALUES ('pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(rec.targetDesignId, rec.publicationId, rec.sourceDesignId, rec.sourceVersion,
+      rec.rotation, rec.dx, rec.dy,
+      JSON.stringify(rec.pieceNos), JSON.stringify(rec.items), rec.draftFingerprint);
+  return getPieceImport(info.lastInsertRowid);
+}
+
+function getPieceImportRow(id) {
+  return getDb().prepare('SELECT * FROM piece_imports WHERE id = ?').get(id);
+}
+
+function getPieceImport(id) {
+  return rowToPieceImport(getPieceImportRow(id));
+}
+
+function listPieceImports(filter = {}) {
+  const where = [];
+  const args = [];
+  if (filter.targetDesignId !== undefined) {
+    where.push('target_design_id = ?');
+    args.push(filter.targetDesignId);
+  }
+  if (filter.status !== undefined) {
+    where.push('status = ?');
+    args.push(filter.status);
+  }
+  const sql = 'SELECT * FROM piece_imports' +
+    (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+    ' ORDER BY id DESC';
+  return getDb().prepare(sql).all(...args).map(rowToPieceImport);
+}
+
+function deletePieceImport(id) {
+  const row = getPieceImportRow(id);
+  if (!row) return { code: 'not_found' };
+  if (row.status !== 'pending') return { code: 'not_pending', status: row.status };
+  getDb().prepare('DELETE FROM piece_imports WHERE id = ?').run(id);
+  return { code: 'ok' };
+}
+
+// 确认复用预览：在同一 BEGIN IMMEDIATE 写事务内
+//   1) 预览仍 pending、目标图纸仍在；
+//   2) 目标草稿指纹与预览基准一致（预览后被编辑则 draft_changed，整批不写入）；
+//   3) 几何校验 fns.checkGeometry(frame, existingPieces, items) 必须通过；
+//   4) 整批插入目标草稿，按片号顺序赋予目标图纸的新编号（保留原色），更新图纸时间。
+// fns.checkFingerprint(existingPieces, expected) 返回 true/false；
+// fns.checkGeometry(...) 返回 { ok:true } 或 { ok:false, problems:[...] }。
+// 任一步失败整体回滚；确认成功后预览置为 confirmed，不能再次确认。
+function confirmPieceImport(id, fns = {}) {
+  const d = getDb();
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    const row = getPieceImportRow(id);
+    if (!row) { d.exec('ROLLBACK'); return { code: 'not_found' }; }
+    if (row.status === 'confirmed') {
+      d.exec('ROLLBACK');
+      return { code: 'already_confirmed', pieceImport: rowToPieceImport(row) };
+    }
+
+    const design = d.prepare('SELECT * FROM designs WHERE id = ?').get(row.target_design_id);
+    if (!design) { d.exec('ROLLBACK'); return { code: 'target_not_found' }; }
+
+    const existing = d.prepare('SELECT * FROM pieces WHERE design_id = ? ORDER BY piece_no')
+      .all(row.target_design_id)
+      .map((r) => ({ id: r.id, pieceNo: r.piece_no, color: r.color, polygon: JSON.parse(r.polygon) }));
+
+    if (fns.checkFingerprint && !fns.checkFingerprint(existing, row.draft_fingerprint)) {
+      d.exec('ROLLBACK');
+      return { code: 'draft_changed' };
+    }
+
+    const items = JSON.parse(row.items);
+    const frame = { width: design.width_mm, height: design.height_mm };
+    if (fns.checkGeometry) {
+      const geometry = fns.checkGeometry(frame, existing, items);
+      if (!geometry || geometry.ok === false) {
+        d.exec('ROLLBACK');
+        return { code: 'geometry_conflict', problems: (geometry && geometry.problems) || [] };
+      }
+    }
+
+    // 整批插入：顺序沿用预览 items（即请求 pieceNos 顺序），编号依次递增
+    let nextNo = d.prepare('SELECT COALESCE(MAX(piece_no), 0) + 1 AS n FROM pieces WHERE design_id = ?')
+      .get(design.id).n;
+    const insertStmt = d.prepare(
+      'INSERT INTO pieces (design_id, piece_no, color, polygon) VALUES (?, ?, ?, ?)');
+    const confirmedPieces = [];
+    for (const it of items) {
+      insertStmt.run(design.id, nextNo, it.color, JSON.stringify(it.polygon));
+      confirmedPieces.push({
+        pieceNo: nextNo,
+        sourcePieceNo: it.sourcePieceNo,
+        color: it.color,
+        polygon: it.polygon,
+      });
+      nextNo += 1;
+    }
+    touchDesign(design.id);
+    d.prepare(`UPDATE piece_imports
+      SET status = 'confirmed', confirmed_at = datetime('now'), confirmed_pieces = ?
+      WHERE id = ?`).run(JSON.stringify(confirmedPieces), id);
+
+    d.exec('COMMIT');
+    return { code: 'ok', pieceImport: getPieceImport(id), confirmedPieces };
+  } catch (e) {
+    d.exec('ROLLBACK');
+    throw e;
+  }
+}
+
 module.exports = {
   init, getDb,
   createDesign, getDesign, listDesigns,
@@ -2233,4 +2398,6 @@ module.exports = {
   leadPickedForMaterial, glassPickedForSheet, leadPickedForPlan, glassPickedForOrderSheet,
   orderHasIssues, planHasIssues, getPlanIssueStats, getOrderIssueStats, getComboIssueStats,
   listLedgerEntries,
+  createPieceImport, getPieceImport, getPieceImportRow, listPieceImports,
+  deletePieceImport, confirmPieceImport,
 };
